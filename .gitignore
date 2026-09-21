@@ -1,0 +1,18 @@
+# Gradle
+.gradle/
+build/
+
+# Build output — the release jar is published on GitHub Releases, not committed.
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store

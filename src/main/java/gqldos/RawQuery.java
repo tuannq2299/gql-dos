@@ -77,18 +77,6 @@ public final class RawQuery {
         return sb.toString();
     }
 
-    /** Header with a caller-supplied operation name, variable defs preserved. */
-    public String header(String newName) {
-        StringBuilder sb = new StringBuilder(keyword);
-        if (newName != null && !newName.isEmpty()) {
-            sb.append(' ').append(newName);
-        }
-        if (!varDefs.isEmpty()) {
-            sb.append(varDefs);
-        }
-        return sb.toString();
-    }
-
     /** Splits the body into its top-level field selections. */
     public List<String> topLevelFields() {
         List<String> out = new ArrayList<>();
@@ -159,7 +147,25 @@ public final class RawQuery {
      * Used by the directive-overload vector on a real captured field.
      */
     public static String withDirectives(String field, String directives) {
-        int brace = -1;
+        int brace = selectionSetStart(field);
+        return brace < 0
+                ? field + " " + directives
+                : field.substring(0, brace) + directives + " " + field.substring(brace);
+    }
+
+    /**
+     * The field without its selection set: name, arguments and directives only.
+     * Used when a generated payload supplies its own selection set but wants to
+     * keep the captured field's arguments, including {@code $variable}
+     * references that the preserved envelope still carries.
+     */
+    public static String fieldHead(String field) {
+        int brace = selectionSetStart(field);
+        return (brace < 0 ? field : field.substring(0, brace)).trim();
+    }
+
+    /** Index of the field's own selection-set brace, or -1 if it is a leaf. */
+    private static int selectionSetStart(String field) {
         int depth = 0;
         boolean inStr = false;
         for (int i = 0; i < field.length(); i++) {
@@ -179,13 +185,10 @@ public final class RawQuery {
             } else if (ch == ')' || ch == ']') {
                 depth--;
             } else if (ch == '{' && depth == 0) {
-                brace = i;
-                break;
+                return i;
             }
         }
-        return brace < 0
-                ? field + " " + directives
-                : field.substring(0, brace) + directives + " " + field.substring(brace);
+        return -1;
     }
 
     // ------------------------------------------------------------------ lexing

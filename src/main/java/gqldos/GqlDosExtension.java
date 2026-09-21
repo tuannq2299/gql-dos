@@ -27,11 +27,16 @@ public class GqlDosExtension implements BurpExtension {
         JTabbedPane tabs = new JTabbedPane();
         tabs.addTab("Scanner", scanner);
         tabs.addTab("Generator", generator);
+        api.userInterface().applyThemeToComponent(tabs);
         api.userInterface().registerSuiteTab("GraphQL DoS", tabs);
 
         api.userInterface().registerContextMenuItemsProvider(new ContextMenuItemsProvider() {
             @Override
             public List<Component> provideMenuItems(ContextMenuEvent event) {
+                // Only offer the item where there is actually a request to import.
+                if (resolve(event).isEmpty()) {
+                    return Collections.emptyList();
+                }
                 JMenuItem item = new JMenuItem("Send to GraphQL DoS Probe");
                 item.addActionListener(e -> resolve(event).ifPresent(rr -> {
                     generator.loadFrom(rr.request());
@@ -39,6 +44,15 @@ public class GqlDosExtension implements BurpExtension {
                 }));
                 return Collections.singletonList(item);
             }
+        });
+
+        // Required by the BApp Store criteria: background threads must stop
+        // when the extension is unloaded, otherwise an in-flight scan keeps
+        // sending requests at the target after the user has unloaded us.
+        api.extension().registerUnloadingHandler(() -> {
+            scanner.shutdown();
+            generator.shutdown();
+            api.logging().logToOutput(NAME + " unloaded; background work stopped.");
         });
 
         api.logging().logToOutput(NAME + " loaded. Tab: 'GraphQL DoS' (Scanner, Generator).");

@@ -10,10 +10,18 @@ generator sends nothing at all — you fire from Repeater when you choose to.
 
 ## Install
 
-Load `gql-dos-1.0.jar` via **Extensions → Installed → Add → Extension type: Java**.
-A tab named **GraphQL DoS** appears. Java 17+ (Burp's bundled JRE is fine).
+Build it:
 
-To rebuild: `./gradlew jar` → `build/libs/gql-dos-1.0.jar`. Bump the `montoya-api`
+```
+./gradlew jar
+```
+
+That writes `build/libs/gql-dos-1.0.0.jar`. Load it via
+**Extensions → Installed → Add → Extension type: Java**. A tab named **GraphQL DoS**
+appears.
+
+The jar targets Java 17 bytecode, so Burp's bundled JRE runs it as-is. Building needs a
+JDK 17 or newer; the Gradle wrapper fetches Gradle itself. Bump the `montoya-api`
 version in `build.gradle` to match your Burp if it fails to load.
 
 ---
@@ -39,6 +47,11 @@ server nothing — you're testing the validator, not the resolvers. A 100-alias
 `__typename` query returning 200 proves there is no alias cap while executing zero
 business logic.
 
+The introspection probe runs first and reports the endpoint's query root type. Two later
+probes have to name that type, and it is only called `Query` by convention — Shopify uses
+`QueryRoot`. The remaining probes are rebuilt around whatever name comes back, so they
+test the control instead of failing on an unknown type.
+
 | Probe | Tells you |
 |---|---|
 | Introspection | schema is readable, recursive edges discoverable |
@@ -59,10 +72,10 @@ generator vectors are open.
 |---|---|
 | **No limit** | payload accepted — the control is absent |
 | **Limited** | rejected by a limit, with the server's message as evidence |
-| **Inconclusive** | errored for an unrelated reason; not evidence either way |
+| **Inconclusive** | errored for an unrelated reason, or never reached the server |
 | **Error** | 5xx or no response |
 
-Four things to not misread:
+Five things to not misread:
 
 - **Scan authenticated.** Limits are often applied to anonymous traffic only. An
   unauthenticated scan can report the front door locked while the real path is open.
@@ -72,6 +85,15 @@ Four things to not misread:
   asked to do any work.
 - **Depth needs introspection.** With it disabled you get Inconclusive — supply a known
   recursive edge in the Generator's Schema fields tab instead.
+- **A WAF answering instead of the server is Inconclusive, not Limited.** A 4xx with no
+  GraphQL body means the request never reached the resolver, so it says nothing about
+  the endpoint's cost controls. `413` is the exception and reports Limited: a body-size
+  ceiling is a real control, wherever it is enforced.
+
+Evidence for **Limited** is matched against the `message` values inside the GraphQL
+`errors` array, not the whole response. Words like `cost` and `limit` appear in ordinary
+result data — Apollo returns a cost breakdown in `extensions` on success — and matching
+those would report a control that is not there.
 
 ---
 
@@ -80,6 +102,11 @@ Four things to not misread:
 Pick a **Vector**, set **Count (N)**, click **Generate payload**, then
 **Copy to clipboard** or **Send to Repeater**. Nothing is sent until you press Send
 in Repeater.
+
+The payload box is a preview and is read-only; past 512 KB it shows the first 512 KB and
+says so. Copy and Send to Repeater always use the whole payload. Edit in Repeater, where
+what you see is what gets sent. Changing any input clears the preview, so the buttons
+can't hand out a payload the form no longer describes.
 
 ### Captured request (default tab)
 
@@ -97,20 +124,28 @@ are then absent, so paste the full body for anything variable-driven.
 ### Schema fields (second tab)
 
 For building payloads with no captured traffic, or for shapes the client never sends.
-Three vectors need recursion that a captured query doesn't contain, and this is the only
-way to reach them.
+
+**Cycle field** and **Type name** are also read by the three recursion vectors when you
+are on the Captured request tab. A captured client query has no recursive edge in it —
+one that did would already be the interesting query — so the edge has to come from here.
+Those vectors then combine it with the captured operation's own header, root field and
+arguments, and the envelope is preserved as usual, variables included. The captured
+selection set is replaced, and the original document's fragment definitions are dropped
+with it: an unused fragment is a validation error, and being rejected for that would
+tell you nothing about the control you're testing.
 
 | Field | Role | Example |
 |---|---|---|
-| Root field | entry point with args | `user(id:1)` |
+| Root field | entry point with args *(schema mode; captured mode uses the captured field)* | `user(id:1)` |
 | Leaf field | terminal scalar | `name` |
-| Cycle field | self-referencing edge | `friends` |
-| Type name | what the cycle field returns | `User` |
+| Cycle field | self-referencing edge *(both modes)* | `friends` |
+| Type name | what the cycle field returns *(both modes)* | `User` |
 | Fan-out | refs per level *(nested+alias only)* | `2` |
 
-Source these from introspection or InQL's circular-reference output. Arguments must be
-inline literals here — there is no variables object — so it's awkward for operations
-taking input objects.
+Source these from introspection or InQL's circular-reference output. In schema mode the
+arguments must be inline literals — there is no variables object — so it's awkward for
+operations taking input objects. Drive those from the Captured request tab instead,
+which keeps the real `variables`.
 
 ### Vectors
 
@@ -125,8 +160,9 @@ taking input objects.
 | Deep introspection | `ofType` levels | no |
 | Nested + alias | **depth** (nodes = fan-out^N) | **yes** |
 
-The three marked *yes* fail with a clear message if the schema has no self-referencing
-field. That's not a bug — the vector genuinely doesn't apply.
+The three marked *yes* need **Cycle field** set, and the two fragment-based ones need
+**Type name** as well. They work from either tab. If the schema has no self-referencing
+edge, the vector genuinely doesn't apply and there is nothing to fill in.
 
 **Nested + alias** is the one worth reaching for when it's available. Layered fragments
 keep the request linear in size while server-side expansion is exponential: fan-out 2 at
@@ -159,7 +195,11 @@ Cost per alias is the size of the field you're multiplying. For a 1.3 KB operati
 | 10,000 | ~13 MB |
 
 Past ~5 MB the status line warns you: a proxy or body-size limit will usually reject the
-request before the server costs it, which is easy to misread as "protected."
+request before the server costs it, which is easy to misread as "protected." Past 32 MB
+the payload is refused outright, before anything is allocated — an N that large is a
+typo, and building it would cost Burp more than it costs the target.
+
+Generation runs off the UI thread, so a large N doesn't freeze Burp.
 
 Trimming the selection set to a single scalar roughly halves the bytes per alias. If the
 expensive work happens in the root resolver, you keep full server cost at half the size.
@@ -185,3 +225,9 @@ For the PoC, use the smallest N that shows clear degradation, not the largest yo
 Confirm resource exhaustion is in scope first. Many YesWeHack and HackerOne programs
 exclude DoS outright, and on a shared staging environment a ramp will show up in APM
 before it shows up in your results.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).

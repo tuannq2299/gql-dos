@@ -9,8 +9,8 @@ import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Runs the control probes and reports which cost limits are missing. */
@@ -18,6 +18,8 @@ public class ScanPanel extends JPanel {
 
     private final MontoyaApi api;
     private final AtomicBoolean stopFlag = new AtomicBoolean(false);
+    /** The in-flight scan, so it can be stopped when the extension unloads. */
+    private volatile Thread worker;
 
     private final JTextField urlField = new JTextField("https://target/graphql", 40);
     private final JTextArea headersArea = new JTextArea(3, 40);
@@ -40,7 +42,8 @@ public class ScanPanel extends JPanel {
     private final JLabel status = new JLabel("Idle. Probes resolve only __typename and introspection "
             + "meta-fields, so they cost the server nothing.");
 
-    private final List<Scanner.Finding> findings = new ArrayList<>();
+    /** Written by the scan thread, read on the EDT. */
+    private final List<Scanner.Finding> findings = new CopyOnWriteArrayList<>();
 
     public ScanPanel(MontoyaApi api) {
         this.api = api;
@@ -55,6 +58,20 @@ public class ScanPanel extends JPanel {
         copyBtn.addActionListener(e -> copyFindings());
         stopBtn.setEnabled(false);
         table.getSelectionModel().addListSelectionListener(e -> showRationale());
+    }
+
+    /**
+     * Stops the scan thread. Called from the extension's unloading handler:
+     * a daemon thread is not enough, because Burp keeps running after an
+     * unload and an in-flight scan would go on hitting the target with no UI
+     * left to stop it from.
+     */
+    public void shutdown() {
+        stopFlag.set(true);
+        Thread t = worker;
+        if (t != null) {
+            t.interrupt();
+        }
     }
 
     private JComponent buildForm() {
@@ -97,12 +114,14 @@ public class ScanPanel extends JPanel {
                 Component c = super.getTableCellRendererComponent(t, v, sel, foc, row, col);
                 String s = String.valueOf(v);
                 if (!sel) {
+                    // Resolved per paint, not cached: the user can switch Burp
+                    // between the light and dark themes while we are loaded.
                     if (Scanner.Verdict.ABSENT.label.equals(s)) {
-                        c.setForeground(new Color(0xC0, 0x39, 0x2B));
+                        c.setForeground(Ui.bad(api));
                     } else if (Scanner.Verdict.PRESENT.label.equals(s)) {
-                        c.setForeground(new Color(0x27, 0x80, 0x4F));
+                        c.setForeground(Ui.good(api));
                     } else {
-                        c.setForeground(new Color(0x80, 0x80, 0x80));
+                        c.setForeground(Ui.hint(api));
                     }
                 }
                 return c;
@@ -127,7 +146,7 @@ public class ScanPanel extends JPanel {
         buttons.add(stopBtn);
         buttons.add(copyBtn);
         p.add(buttons, BorderLayout.WEST);
-        status.setForeground(new Color(0x50, 0x50, 0x50));
+        status.setForeground(Ui.hint(api));
         p.add(status, BorderLayout.SOUTH);
         return p;
     }
@@ -152,11 +171,16 @@ public class ScanPanel extends JPanel {
 
     private void showRationale() {
         int row = table.getSelectedRow();
-        if (row < 0 || row >= findings.size()) {
+        if (row < 0) {
             rationale.setText("");
             return;
         }
-        Scanner.Finding f = findings.get(table.convertRowIndexToModel(row));
+        int idx = table.convertRowIndexToModel(row);
+        if (idx < 0 || idx >= findings.size()) {
+            rationale.setText("");
+            return;
+        }
+        Scanner.Finding f = findings.get(idx);
         rationale.setText(f.probe.rationale + "\n\nPayload: " + f.probe.body);
         rationale.setCaretPosition(0);
     }
@@ -178,16 +202,18 @@ public class ScanPanel extends JPanel {
         stopFlag.set(false);
         scanBtn.setEnabled(false);
         stopBtn.setEnabled(true);
+        status.setForeground(Ui.hint(api));
         long delay = ((Integer) delaySpin.getValue()).longValue();
 
         Thread t = new Thread(() -> {
             try {
                 List<Scanner.Probe> probes = Scanner.probes();
-                for (Scanner.Probe probe : probes) {
-                    if (stopFlag.get()) {
+                for (int i = 0; i < probes.size(); i++) {
+                    if (stopFlag.get() || Thread.currentThread().isInterrupted()) {
                         setStatus("Stopped.");
-                        break;
+                        return;
                     }
+                    Scanner.Probe probe = probes.get(i);
                     long t0 = System.nanoTime();
                     int code = 0;
                     String respBody = "";
@@ -208,6 +234,20 @@ public class ScanPanel extends JPanel {
                             f.probe.control, f.verdict.label, f.evidence,
                             f.status == 0 ? "-" : String.valueOf(f.status), f.ms, f.reqBytes}));
 
+                    // The introspection probe asked the server for its query
+                    // root type name. Rebuild the remaining probes around the
+                    // answer: depth and fragment-cycle both name that type, and
+                    // a guess of "Query" against a QueryRoot schema tests
+                    // nothing while reporting Inconclusive.
+                    if (probe.kind == Scanner.Kind.INTROSPECTION) {
+                        String root = Scanner.rootTypeFrom(respBody);
+                        if (!Scanner.DEFAULT_ROOT_TYPE.equals(root)) {
+                            probes = Scanner.probes(root);
+                            setStatus("Query root type is '" + root + "'; remaining probes "
+                                    + "rebuilt against it.");
+                        }
+                    }
+
                     if (delay > 0) {
                         Thread.sleep(delay);
                     }
@@ -215,7 +255,9 @@ public class ScanPanel extends JPanel {
                 setStatus(Scanner.summary(findings));
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
+                setStatus("Stopped.");
             } finally {
+                worker = null;
                 SwingUtilities.invokeLater(() -> {
                     scanBtn.setEnabled(true);
                     stopBtn.setEnabled(false);
@@ -223,6 +265,7 @@ public class ScanPanel extends JPanel {
             }
         }, "gql-dos-scanner");
         t.setDaemon(true);
+        worker = t;
         t.start();
     }
 

