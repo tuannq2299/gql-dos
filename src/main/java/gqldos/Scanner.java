@@ -354,12 +354,31 @@ public final class Scanner {
         }
     }
 
+    /**
+     * True when the fragment-cycle probe got no usable answer.
+     *
+     * A compliant validator rejects the cycle and a broken one spins on it, so
+     * the "accepted" verdict this probe was written to produce is close to
+     * unreachable in practice: the interesting outcome arrives as a timeout or
+     * a 5xx, which classifies as {@link Verdict#ERROR}. Counting only ABSENT
+     * would drop the strongest result the scan can produce.
+     */
+    public static boolean cycleUnanswered(Finding f) {
+        return f.probe.kind == Kind.FRAGMENT_CYCLE && f.verdict == Verdict.ERROR;
+    }
+
     /** Which generator vectors the findings leave open. */
     public static String summary(List<Finding> findings) {
         int absent = 0;
         List<String> open = new ArrayList<>();
         boolean introspection = false;
+        boolean cycleHung = false;
         for (Finding f : findings) {
+            if (cycleUnanswered(f)) {
+                cycleHung = true;
+                open.add("Circular fragments");
+                continue;
+            }
             if (f.verdict != Verdict.ABSENT) {
                 continue;
             }
@@ -374,10 +393,16 @@ public final class Scanner {
                 default: break;
             }
         }
-        if (absent == 0) {
+        if (absent == 0 && !cycleHung) {
             return "No missing controls detected. Every probe was rejected or limited.";
         }
         StringBuilder sb = new StringBuilder();
+        if (cycleHung) {
+            sb.append("The fragment-cycle probe got no answer. A validator that neither "
+                    + "rejects a cycle nor returns is spinning on it, and that is the "
+                    + "strongest result here: no authentication, no resolver work, 200 bytes. "
+                    + "Time it in Repeater before reporting anything else. ");
+        }
         sb.append(absent).append(" of ").append(findings.size()).append(" controls absent. ");
         if (!open.isEmpty()) {
             sb.append("Vectors open: ").append(String.join(", ", open)).append(". ");

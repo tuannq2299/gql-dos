@@ -28,7 +28,9 @@ public class DosPanel extends JPanel {
      */
     private static final int PREVIEW_LIMIT = 512 * 1024;
 
-    private final MontoyaApi api;
+    // Not final: the hint labels are field initialisers and read it through a
+    // supplier, which definite-assignment rules forbid on a blank final.
+    private MontoyaApi api;
     private final PayloadFactory.Config cfg = new PayloadFactory.Config();
 
     private final JTextField urlField = new JTextField("https://target/graphql", 40);
@@ -36,7 +38,7 @@ public class DosPanel extends JPanel {
 
     private final JComboBox<PayloadFactory.Vector> vectorBox =
             new JComboBox<>(PayloadFactory.Vector.values());
-    private final JLabel vectorHelp = new JLabel(" ");
+    private final JLabel vectorHelp = Ui.hintLabel(() -> api, " ");
     private final JTextField aliasPrefixField = new JTextField("a", 8);
     private final JSpinner countSpin = new JSpinner(new SpinnerNumberModel(100, 1, 1_000_000, 1));
 
@@ -53,7 +55,7 @@ public class DosPanel extends JPanel {
     private final JButton generateBtn = new JButton("Generate payload");
     private final JButton copyBtn = new JButton("Copy to clipboard");
     private final JButton repeaterBtn = new JButton("Send to Repeater");
-    private final JLabel status = new JLabel("Idle.");
+    private final JLabel status = Ui.hintLabel(() -> api, "Idle.");
 
     /** The built payload in full; the preview box may hold a truncated copy. */
     private volatile String payload = "";
@@ -155,7 +157,6 @@ public class DosPanel extends JPanel {
         g.gridx = 5; top.add(aliasPrefixField, g);
 
         g.gridx = 0; g.gridy = 3; g.gridwidth = 8;
-        vectorHelp.setForeground(Ui.hint(api));
         top.add(vectorHelp, g);
 
         outer.add(top, BorderLayout.NORTH);
@@ -229,7 +230,6 @@ public class DosPanel extends JPanel {
         buttons.add(copyBtn);
         buttons.add(repeaterBtn);
         p.add(buttons, BorderLayout.WEST);
-        status.setForeground(Ui.hint(api));
         p.add(status, BorderLayout.SOUTH);
         return p;
     }

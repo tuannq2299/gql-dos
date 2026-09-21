@@ -25,8 +25,8 @@ public class GqlDosExtension implements BurpExtension {
         ScanPanel scanner = new ScanPanel(api);
 
         JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Scanner", scanner);
         tabs.addTab("Generator", generator);
+        tabs.addTab("Scanner", scanner);
         api.userInterface().applyThemeToComponent(tabs);
         api.userInterface().registerSuiteTab("GraphQL DoS", tabs);
 

@@ -148,9 +148,10 @@ public final class RawQuery {
      */
     public static String withDirectives(String field, String directives) {
         int brace = selectionSetStart(field);
+        String d = directives.startsWith(" ") ? directives : " " + directives;
         return brace < 0
-                ? field + " " + directives
-                : field.substring(0, brace) + directives + " " + field.substring(brace);
+                ? field + d
+                : field.substring(0, brace).stripTrailing() + d + " " + field.substring(brace);
     }
 
     /**

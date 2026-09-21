@@ -3,12 +3,14 @@ package gqldos;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.scanner.audit.issues.AuditIssue;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -16,7 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** Runs the control probes and reports which cost limits are missing. */
 public class ScanPanel extends JPanel {
 
-    private final MontoyaApi api;
+    // Not final: the hint labels are field initialisers and read it through a
+    // supplier, which definite-assignment rules forbid on a blank final.
+    private MontoyaApi api;
     private final AtomicBoolean stopFlag = new AtomicBoolean(false);
     /** The in-flight scan, so it can be stopped when the extension unloads. */
     private volatile Thread worker;
@@ -24,6 +28,7 @@ public class ScanPanel extends JPanel {
     private final JTextField urlField = new JTextField("https://target/graphql", 40);
     private final JTextArea headersArea = new JTextArea(3, 40);
     private final JCheckBox scopeBox = new JCheckBox("Require target in Burp scope", true);
+    private final JCheckBox reportBox = new JCheckBox("File findings as Burp issues", true);
     private final JSpinner delaySpin = new JSpinner(new SpinnerNumberModel(300, 0, 10_000, 50));
 
     private final DefaultTableModel model = new DefaultTableModel(
@@ -39,11 +44,31 @@ public class ScanPanel extends JPanel {
     private final JButton scanBtn = new JButton("Run scan");
     private final JButton stopBtn = new JButton("Stop");
     private final JButton copyBtn = new JButton("Copy findings");
-    private final JLabel status = new JLabel("Idle. Probes resolve only __typename and introspection "
-            + "meta-fields, so they cost the server nothing.");
+    private final JLabel status = Ui.hintLabel(() -> api,
+            "Idle. Probes resolve only __typename and introspection meta-fields, so they "
+            + "cost the server nothing.");
+
+    /** A finding together with the exchange that produced it, kept as issue evidence. */
+    private static final class Row {
+        final Scanner.Finding finding;
+        final HttpRequestResponse exchange;
+
+        Row(Scanner.Finding finding, HttpRequestResponse exchange) {
+            this.finding = finding;
+            this.exchange = exchange;
+        }
+    }
 
     /** Written by the scan thread, read on the EDT. */
-    private final List<Scanner.Finding> findings = new CopyOnWriteArrayList<>();
+    private final List<Row> rows = new CopyOnWriteArrayList<>();
+
+    private List<Scanner.Finding> findings() {
+        List<Scanner.Finding> out = new ArrayList<>(rows.size());
+        for (Row r : rows) {
+            out.add(r.finding);
+        }
+        return out;
+    }
 
     public ScanPanel(MontoyaApi api) {
         this.api = api;
@@ -96,6 +121,10 @@ public class ScanPanel extends JPanel {
         g.gridx = 0; g.gridy = 2; p.add(new JLabel("Options"), g);
         JPanel opts = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         opts.add(scopeBox);
+        reportBox.setToolTipText("Missing controls are added to Burp's Issues view and the "
+                + "site map, with the probe exchange attached as evidence. Controls that "
+                + "fired are not filed -- they are not findings.");
+        opts.add(reportBox);
         opts.add(new JLabel("delay ms"));
         opts.add(delaySpin);
         g.gridx = 1; g.gridwidth = 3;
@@ -146,7 +175,6 @@ public class ScanPanel extends JPanel {
         buttons.add(stopBtn);
         buttons.add(copyBtn);
         p.add(buttons, BorderLayout.WEST);
-        status.setForeground(Ui.hint(api));
         p.add(status, BorderLayout.SOUTH);
         return p;
     }
@@ -176,11 +204,11 @@ public class ScanPanel extends JPanel {
             return;
         }
         int idx = table.convertRowIndexToModel(row);
-        if (idx < 0 || idx >= findings.size()) {
+        if (idx < 0 || idx >= rows.size()) {
             rationale.setText("");
             return;
         }
-        Scanner.Finding f = findings.get(idx);
+        Scanner.Finding f = rows.get(idx).finding;
         rationale.setText(f.probe.rationale + "\n\nPayload: " + f.probe.body);
         rationale.setCaretPosition(0);
     }
@@ -197,31 +225,33 @@ public class ScanPanel extends JPanel {
         }
 
         model.setRowCount(0);
-        findings.clear();
+        rows.clear();
         rationale.setText("");
         stopFlag.set(false);
         scanBtn.setEnabled(false);
         stopBtn.setEnabled(true);
-        status.setForeground(Ui.hint(api));
         long delay = ((Integer) delaySpin.getValue()).longValue();
+        boolean fileIssues = reportBox.isSelected();
 
         Thread t = new Thread(() -> {
             try {
+                boolean stopped = false;
                 List<Scanner.Probe> probes = Scanner.probes();
                 for (int i = 0; i < probes.size(); i++) {
                     if (stopFlag.get() || Thread.currentThread().isInterrupted()) {
-                        setStatus("Stopped.");
-                        return;
+                        stopped = true;
+                        break;
                     }
                     Scanner.Probe probe = probes.get(i);
                     long t0 = System.nanoTime();
                     int code = 0;
                     String respBody = "";
+                    HttpRequestResponse exchange = null;
                     try {
-                        HttpRequestResponse rr = api.http().sendRequest(buildRequest(url, probe.body));
-                        if (rr.response() != null) {
-                            code = rr.response().statusCode();
-                            respBody = rr.response().bodyToString();
+                        exchange = api.http().sendRequest(buildRequest(url, probe.body));
+                        if (exchange.response() != null) {
+                            code = exchange.response().statusCode();
+                            respBody = exchange.response().bodyToString();
                         }
                     } catch (Exception ex) {
                         respBody = "";
@@ -229,7 +259,7 @@ public class ScanPanel extends JPanel {
                     long ms = (System.nanoTime() - t0) / 1_000_000L;
 
                     Scanner.Finding f = Scanner.evaluate(probe, code, respBody, ms);
-                    findings.add(f);
+                    rows.add(new Row(f, exchange));
                     SwingUtilities.invokeLater(() -> model.addRow(new Object[]{
                             f.probe.control, f.verdict.label, f.evidence,
                             f.status == 0 ? "-" : String.valueOf(f.status), f.ms, f.reqBytes}));
@@ -252,7 +282,8 @@ public class ScanPanel extends JPanel {
                         Thread.sleep(delay);
                     }
                 }
-                setStatus(Scanner.summary(findings));
+                String filed = fileIssues ? fileIssues(url) : "";
+                setStatus((stopped ? "Stopped. " : "") + Scanner.summary(findings()) + filed);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 setStatus("Stopped.");
@@ -285,21 +316,46 @@ public class ScanPanel extends JPanel {
     }
 
     private void copyFindings() {
-        if (findings.isEmpty()) {
+        if (rows.isEmpty()) {
             status.setText("Nothing to copy. Run a scan first.");
             return;
         }
         StringBuilder sb = new StringBuilder();
         sb.append("GraphQL cost-control scan -- ").append(urlField.getText().trim()).append("\n\n");
         sb.append("| Control | Verdict | Evidence |\n|---|---|---|\n");
-        for (Scanner.Finding f : findings) {
+        for (Scanner.Finding f : findings()) {
             sb.append("| ").append(f.probe.control)
               .append(" | ").append(f.verdict.label)
               .append(" | ").append(f.evidence.replace("|", "\\|")).append(" |\n");
         }
-        sb.append('\n').append(Scanner.summary(findings)).append('\n');
+        sb.append('\n').append(Scanner.summary(findings())).append('\n');
         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(sb.toString()), null);
         status.setText("Findings copied as a Markdown table.");
+    }
+
+    /**
+     * Adds an issue for every missing control. Runs on the scan thread, after
+     * the probes are done, so a slow site map write cannot stall the UI.
+     *
+     * @return a fragment to append to the status line
+     */
+    private String fileIssues(String url) {
+        int filed = 0;
+        for (Row r : rows) {
+            AuditIssue issue = Issues.from(r.finding, url, r.exchange);
+            if (issue == null) {
+                continue;
+            }
+            try {
+                api.siteMap().add(issue);
+                filed++;
+            } catch (RuntimeException ex) {
+                api.logging().logToError("Could not file issue for "
+                        + r.finding.probe.control + ": " + ex);
+            }
+        }
+        return filed == 0 ? "" : "  " + filed + " issue" + (filed == 1 ? "" : "s")
+                + " added to Burp's Issues view.";
     }
 
     private void setStatus(String s) {

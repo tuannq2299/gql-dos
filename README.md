@@ -2,11 +2,13 @@
 
 Burp extension for testing GraphQL query-cost controls. Two tabs:
 
-- **Scanner** — detects which cost limits are missing, without applying load.
 - **Generator** — builds a payload at a chosen size for the vectors the scan left open.
+- **Scanner** — detects which cost limits are missing, without applying load.
 
 Neither tab attacks anything on its own. The scanner sends seven tiny probes; the
 generator sends nothing at all — you fire from Repeater when you choose to.
+
+No AI, no credits, no outbound calls of its own. Works in Burp Community.
 
 ## Install
 
@@ -16,7 +18,7 @@ Build it:
 ./gradlew jar
 ```
 
-That writes `build/libs/gql-dos-1.0.0.jar`. Load it via
+That writes `build/libs/gql-dos-1.0.0.jar`. Run the tests with `./gradlew test`. Load it via
 **Extensions → Installed → Add → Extension type: Java**. A tab named **GraphQL DoS**
 appears.
 
@@ -66,6 +68,11 @@ Click any row for the rationale and the exact payload sent.
 **Copy findings** puts a Markdown table on the clipboard, plus a summary naming which
 generator vectors are open.
 
+With **File findings as Burp issues** left on, every missing control is added to Burp's
+Issues view and the site map when the scan finishes, with the probe's request and
+response attached as evidence. Controls that fired are not filed — a control that works
+is not a finding, and filing it would bury the ones that matter.
+
 ### Reading the verdicts
 
 | Verdict | Meaning |
@@ -89,6 +96,13 @@ Five things to not misread:
   GraphQL body means the request never reached the resolver, so it says nothing about
   the endpoint's cost controls. `413` is the exception and reports Limited: a body-size
   ceiling is a real control, wherever it is enforced.
+
+One verdict is worth more than the rest. A compliant validator rejects the fragment
+cycle and a broken one never comes back, so the fragment-cycle probe's interesting
+result arrives as **Error**, not as No limit. The summary and the issue list both call
+that case out: a validator you hung with 200 unauthenticated bytes and zero resolver
+work is the strongest thing this scan can find. Time it in Repeater before writing up
+anything else.
 
 Evidence for **Limited** is matched against the `message` values inside the GraphQL
 `errors` array, not the whole response. Words like `cost` and `limit` appear in ordinary
@@ -225,6 +239,23 @@ For the PoC, use the smallest N that shows clear degradation, not the largest yo
 Confirm resource exhaustion is in scope first. Many YesWeHack and HackerOne programs
 exclude DoS outright, and on a shared staging environment a ramp will show up in APM
 before it shows up in your results.
+
+---
+
+## Development
+
+```
+./gradlew test    # 56 tests: payload construction, verdict classification, parsing
+./gradlew jar     # build/libs/gql-dos-1.0.0.jar
+```
+
+No runtime dependencies. `montoya-api` is `compileOnly` — Burp provides it — so the jar
+ships nothing but this extension's own classes. JUnit is test-scoped and never reaches
+the jar.
+
+The verdict classifier is where the tests earn their place: a wrong verdict is worse
+than no verdict, because it goes in a report. Cases with a named regression are marked
+as such in the test bodies.
 
 ---
 
